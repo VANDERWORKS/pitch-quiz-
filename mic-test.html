@@ -1,0 +1,267 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>マイクテスト</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#060d1a;--s1:#0a1628;--s2:#0f2040;--border:#1a3a5c;
+  --accent:#06b6d4;--correct:#10b981;--wrong:#f87171;--gold:#f59e0b;--text:#e0f4f8;--muted:#4a7a8a;
+}
+body{
+  background:var(--bg);color:var(--text);
+  font-family:'Hiragino Sans','Noto Sans JP',sans-serif;
+  min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px;
+}
+.card{
+  background:var(--s1);border:1px solid var(--border);border-radius:14px;
+  padding:24px 18px;width:100%;max-width:400px;
+  display:flex;flex-direction:column;align-items:center;gap:16px;
+}
+h1{font-size:1.2rem;font-weight:800;color:var(--accent)}
+.status{
+  width:100%;padding:12px;border-radius:10px;font-size:0.86rem;font-weight:600;text-align:center;
+  background:var(--s2);color:var(--muted);transition:all 0.3s;
+}
+.status.listening{background:rgba(6,182,212,0.1);color:var(--accent)}
+.status.active{background:rgba(16,185,129,0.1);color:var(--correct)}
+.status.error{background:rgba(248,113,113,0.1);color:var(--wrong)}
+
+/* 音量メーター */
+.meter-wrap{
+  width:100%;height:28px;background:var(--s2);border-radius:99px;overflow:hidden;border:1px solid var(--border);
+}
+.meter-fill{
+  height:100%;width:0%;border-radius:99px;
+  background:linear-gradient(90deg,var(--correct),var(--accent));
+  transition:width 0.05s ease;
+}
+
+/* 音名表示 */
+.note-display{
+  font-size:4rem;font-weight:800;color:var(--text);
+  min-height:80px;display:flex;align-items:center;justify-content:center;
+  transition:color 0.15s;
+}
+.note-display.active{color:var(--accent)}
+.hz-display{font-size:0.82rem;color:var(--muted);min-height:20px}
+
+/* バーインジケーター */
+.bar-wrap{
+  width:100%;height:20px;background:var(--s2);border-radius:99px;overflow:hidden;
+  position:relative;border:1px solid var(--border);
+}
+.bar-wrap::after{
+  content:'';position:absolute;left:50%;top:0;bottom:0;width:2px;
+  background:rgba(255,255,255,0.2);transform:translateX(-50%);
+}
+.bar-fill{
+  position:absolute;height:100%;width:6px;border-radius:99px;
+  background:var(--accent);transform:translateX(-50%);left:50%;
+  transition:left 0.08s ease;
+}
+
+/* ボタン */
+.btn{
+  width:100%;padding:14px;border-radius:12px;border:none;
+  font-size:1rem;font-weight:800;cursor:pointer;transition:all 0.15s;
+}
+.btn-start{background:linear-gradient(135deg,var(--accent),#0891b2);color:#fff;box-shadow:0 4px 14px rgba(6,182,212,0.3)}
+.btn-stop{background:rgba(248,113,113,0.15);border:2px solid var(--wrong);color:var(--wrong)}
+
+.log{
+  width:100%;background:var(--s2);border-radius:10px;padding:10px 12px;
+  font-size:0.72rem;color:var(--muted);line-height:1.8;max-height:120px;overflow-y:auto;
+}
+.log-line{color:var(--text)}
+.log-line.ok{color:var(--correct)}
+.log-line.err{color:var(--wrong)}
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>🎤 iOSマイクテスト</h1>
+
+  <div class="status" id="status">「マイク開始」を押してテストします</div>
+
+  <div class="meter-wrap"><div class="meter-fill" id="meter"></div></div>
+
+  <div class="note-display" id="note-disp">—</div>
+  <div class="hz-display" id="hz-disp"></div>
+
+  <div class="bar-wrap"><div class="bar-fill" id="bar-fill"></div></div>
+
+  <button class="btn btn-start" id="btn-start">🎤 マイク開始</button>
+
+  <div class="log" id="log">ログ：<br></div>
+</div>
+
+<script>
+const NOTE_BASE=[
+  {id:'C',hz:261.63},{id:'C#',hz:277.18},{id:'D',hz:293.66},{id:'D#',hz:311.13},
+  {id:'E',hz:329.63},{id:'F',hz:349.23},{id:'F#',hz:369.99},{id:'G',hz:392.00},
+  {id:'G#',hz:415.30},{id:'A',hz:440.00},{id:'A#',hz:466.16},{id:'B',hz:493.88},
+];
+
+let audioCtx=null, stream=null, processor=null, analyser=null;
+let running=false;
+
+function log(msg, type=''){
+  const el=document.getElementById('log');
+  const line=document.createElement('div');
+  line.className='log-line'+(type?' '+type:'');
+  line.textContent=msg;
+  el.appendChild(line);
+  el.scrollTop=el.scrollHeight;
+}
+
+function setStatus(msg, type=''){
+  const el=document.getElementById('status');
+  el.textContent=msg;
+  el.className='status'+(type?' '+type:'');
+}
+
+// ── ピッチ検出（自己相関法） ──
+function detectPitch(buf, sampleRate){
+  const SIZE=buf.length;
+  const MAX=Math.floor(SIZE/2);
+  let bestOffset=-1, bestCorr=0, lastCorr=1, found=false;
+  for(let offset=0;offset<MAX;offset++){
+    let corr=0;
+    for(let i=0;i<MAX;i++) corr+=Math.abs((buf[i]||0)-(buf[i+offset]||0));
+    corr=1-(corr/MAX);
+    if(corr>0.9&&corr>lastCorr){bestCorr=corr;bestOffset=offset;found=true;break;}
+    lastCorr=corr;
+  }
+  if(!found) for(let offset=0;offset<MAX;offset++){
+    let corr=0;
+    for(let i=0;i<MAX;i++) corr+=Math.abs((buf[i]||0)-(buf[i+offset]||0));
+    corr=1-(corr/MAX);
+    if(corr>bestCorr){bestCorr=corr;bestOffset=offset;}
+  }
+  if(bestCorr<0.01||bestOffset<2) return -1;
+  return sampleRate/bestOffset;
+}
+
+function hzToNote(hz){
+  if(hz<=0) return null;
+  let best=null, bestDist=Infinity;
+  NOTE_BASE.forEach(n=>{
+    [0.5,1,2,4].forEach(mult=>{
+      const dist=Math.abs(1200*Math.log2(hz/(n.hz*mult)));
+      if(dist<bestDist){bestDist=dist;best=n.id;}
+    });
+  });
+  return bestDist<100?best:null;
+}
+
+document.getElementById('btn-start').addEventListener('click', async()=>{
+  if(running){ stopMic(); return; }
+  await startMic();
+});
+
+async function startMic(){
+  log('マイク許可リクエスト中...');
+  setStatus('許可待ち...','listening');
+
+  try{
+    // iOS Safari用：必ずユーザー操作内でAudioContextを作成
+    audioCtx = new (window.AudioContext||window.webkitAudioContext)();
+    log('AudioContext作成: '+audioCtx.state, audioCtx.state==='running'?'ok':'');
+
+    // iOS: suspendedの場合はresumeが必要
+    if(audioCtx.state==='suspended'){
+      await audioCtx.resume();
+      log('AudioContext resume: '+audioCtx.state, 'ok');
+    }
+
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio:{
+        echoCancellation:false,
+        noiseSuppression:false,
+        autoGainControl:false,
+      },
+      video:false
+    });
+    log('マイク取得成功 ✓', 'ok');
+    setStatus('🎤 マイク使用中', 'active');
+
+    const src = audioCtx.createMediaStreamSource(stream);
+    log('MediaStreamSource作成 ✓', 'ok');
+
+    // iOS Safari: AnalyserNodeのみで動くか確認
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    src.connect(analyser);
+    log('Analyser接続 ✓', 'ok');
+
+    // ScriptProcessorNode（iOSフォールバック）
+    const bufSize = 2048;
+    processor = audioCtx.createScriptProcessor(bufSize, 1, 1);
+    analyser.connect(processor);
+    processor.connect(audioCtx.destination);
+    log('ScriptProcessor接続 ✓', 'ok');
+
+    const pitchBuf = new Float32Array(bufSize);
+    running = true;
+    document.getElementById('btn-start').className='btn btn-stop';
+    document.getElementById('btn-start').textContent='⏹ 停止';
+
+    processor.onaudioprocess = (e)=>{
+      const input = e.inputBuffer.getChannelData(0);
+      // 音量計算
+      let rms=0;
+      for(let i=0;i<input.length;i++) rms+=input[i]*input[i];
+      rms=Math.sqrt(rms/input.length);
+      const vol=Math.min(100,rms*400);
+      document.getElementById('meter').style.width=vol+'%';
+
+      if(rms>0.01){
+        // ピッチ検出
+        for(let i=0;i<input.length;i++) pitchBuf[i]=input[i];
+        const hz=detectPitch(pitchBuf, audioCtx.sampleRate);
+        if(hz>80&&hz<2000){
+          const noteId=hzToNote(hz);
+          const noteEl=document.getElementById('note-disp');
+          noteEl.textContent=noteId||'?';
+          noteEl.className='note-display active';
+          document.getElementById('hz-disp').textContent=hz.toFixed(1)+' Hz';
+          // バー（C=261Hzを基準に±1オクターブ）
+          const cents=1200*Math.log2(hz/261.63);
+          const clamped=Math.max(-1200,Math.min(1200,cents));
+          const pct=50+(clamped/1200)*45;
+          document.getElementById('bar-fill').style.left=pct+'%';
+        }
+      } else {
+        document.getElementById('note-disp').textContent='—';
+        document.getElementById('note-disp').className='note-display';
+        document.getElementById('hz-disp').textContent='';
+        document.getElementById('bar-fill').style.left='50%';
+      }
+    };
+
+  } catch(e){
+    log('エラー: '+e.name+' / '+e.message, 'err');
+    setStatus('❌ エラー: '+e.name, 'error');
+  }
+}
+
+function stopMic(){
+  if(processor){ processor.disconnect(); processor=null; }
+  if(analyser){ analyser.disconnect(); analyser=null; }
+  if(stream){ stream.getTracks().forEach(t=>t.stop()); stream=null; }
+  if(audioCtx){ audioCtx.close(); audioCtx=null; }
+  running=false;
+  document.getElementById('btn-start').className='btn btn-start';
+  document.getElementById('btn-start').textContent='🎤 マイク開始';
+  document.getElementById('meter').style.width='0%';
+  document.getElementById('note-disp').textContent='—';
+  document.getElementById('hz-disp').textContent='';
+  setStatus('停止しました');
+  log('停止 ✓');
+}
+</script>
+</body>
+</html>
